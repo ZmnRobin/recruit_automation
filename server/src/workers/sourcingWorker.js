@@ -5,20 +5,20 @@ import { searchCandidates } from '../services/sourcingService.js';
 import Candidate from '../models/Candidate.js';
 import Task from '../models/Task.js';
 import Job from '../models/Job.js';
-import { taskEvents } from '../services/taskEventEmitter.js';
+import { publishTaskUpdate } from '../services/taskPublisher.js';
 
 async function updateTask(task, fields) {
   if (!task) return;
   Object.assign(task, fields);
   await task.save();
-  taskEvents.emitTaskUpdate(task._id.toString(), {
+  await publishTaskUpdate(task._id.toString(), {
     taskId: task._id.toString(),
     type: task.type,
     status: task.status,
     progress: task.progress || 0,
-    result: task.result || null,
+    result: task.result ? JSON.parse(JSON.stringify(task.result)) : null,
     error: task.error || null,
-    jobId: task.jobId?.toString()
+    jobId: task.jobId?.toString(),
   });
 }
 
@@ -40,11 +40,8 @@ export const sourcingWorker = new Worker('sourcing', async (job) => {
 
     let savedCount = 0;
     for (const candidateData of candidatesData) {
-      const existingCandidate = await Candidate.findOne({
-        linkedinUrl: candidateData.linkedinUrl
-      });
-
-      if (!existingCandidate) {
+      const existing = await Candidate.findOne({ linkedinUrl: candidateData.linkedinUrl });
+      if (!existing) {
         const candidate = new Candidate({
           jobId,
           name: candidateData.name,
@@ -54,7 +51,7 @@ export const sourcingWorker = new Worker('sourcing', async (job) => {
           experience: candidateData.experience,
           skills: candidateData.skills,
           location: candidateData.location,
-          sourcedFrom: candidateData.sourcedFrom
+          sourcedFrom: candidateData.sourcedFrom,
         });
         await candidate.save();
         savedCount++;
@@ -64,14 +61,14 @@ export const sourcingWorker = new Worker('sourcing', async (job) => {
     await updateTask(task, {
       status: 'completed',
       progress: 100,
-      result: { found: candidatesData.length, saved: savedCount }
+      result: { found: candidatesData.length, saved: savedCount },
     });
 
     await Job.findByIdAndUpdate(jobId, {
-      $inc: { 'metadata.candidateCount': savedCount }
+      $inc: { 'metadata.candidateCount': savedCount },
     }).catch(() => {});
 
-    console.log(`Sourcing job ${job.id} completed. Found ${savedCount} new candidates.`);
+    console.log(`Sourcing job ${job.id} completed. Saved ${savedCount} candidates.`);
     return { found: candidatesData.length, saved: savedCount };
   } catch (error) {
     console.error(`Sourcing job ${job.id} failed:`, error);
@@ -80,12 +77,7 @@ export const sourcingWorker = new Worker('sourcing', async (job) => {
   }
 }, { connection });
 
-sourcingWorker.on('completed', (job) => {
-  console.log(`Sourcing BullMQ job ${job.id} completed`);
-});
-
-sourcingWorker.on('failed', (job, err) => {
-  console.error(`Sourcing BullMQ job ${job.id} failed:`, err.message);
-});
+sourcingWorker.on('completed', (job) => console.log(`Sourcing BullMQ job ${job.id} completed`));
+sourcingWorker.on('failed', (job, err) => console.error(`Sourcing BullMQ job ${job.id} failed:`, err.message));
 
 export const sourcingQueue = new Queue('sourcing', { connection });

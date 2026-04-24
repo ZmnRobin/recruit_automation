@@ -4,7 +4,7 @@ import Message from '../models/Message.js';
 import Task from '../models/Task.js';
 import { scoringQueue } from '../workers/scoringWorker.js';
 import { outreachQueue } from '../workers/outreachWorker.js';
-import { generateScore, getCachedScore } from '../services/scoringService.js';
+import { getCachedScore } from '../services/scoringService.js';
 
 const router = express.Router();
 
@@ -23,8 +23,7 @@ router.get('/', async (req, res) => {
 // Get candidate by ID
 router.get('/:id', async (req, res) => {
   try {
-    const candidate = await Candidate.findById(req.params.id)
-      .populate('jobId');
+    const candidate = await Candidate.findById(req.params.id).populate('jobId');
     if (!candidate) {
       return res.status(404).json({ success: false, error: 'Candidate not found' });
     }
@@ -42,7 +41,7 @@ router.post('/:id/scores', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Candidate not found' });
     }
 
-    // Check cache first
+    // Check cache first — return immediately, no task needed
     const cachedScore = await getCachedScore(candidate._id.toString());
     if (cachedScore) {
       return res.json({
@@ -68,10 +67,11 @@ router.post('/:id/scores', async (req, res) => {
       taskId: task._id.toString()
     });
 
+    // 202 Accepted — task is queued, client should stream via SSE
     res.status(202).json({
       success: true,
       data: {
-        taskId: task._id,
+        taskId: task._id.toString(),
         status: 'queued'
       }
     });
@@ -90,7 +90,6 @@ router.post('/:id/outreach', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Candidate not found' });
     }
 
-    // Create task to track outreach
     const task = new Task({
       type: 'outreach',
       status: 'queued',
@@ -99,7 +98,6 @@ router.post('/:id/outreach', async (req, res) => {
     });
     await task.save();
 
-    // Add to outreach queue
     await outreachQueue.add('outreach-candidate', {
       candidateId: candidate._id.toString(),
       jobId,
@@ -109,7 +107,7 @@ router.post('/:id/outreach', async (req, res) => {
     res.status(202).json({
       success: true,
       data: {
-        taskId: task._id,
+        taskId: task._id.toString(),
         status: 'queued'
       }
     });
@@ -128,7 +126,6 @@ router.post('/:id/responses', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Candidate not found' });
     }
 
-    // Create inbound message
     const msg = new Message({
       candidateId: candidate._id,
       jobId: candidate.jobId,
@@ -138,21 +135,20 @@ router.post('/:id/responses', async (req, res) => {
     });
     await msg.save();
 
-    // Use AI to classify intent (simple rule-based for now, can be AI-powered)
     const lowerMessage = message.toLowerCase();
     let intent = 'neutral';
 
     if (lowerMessage.includes('yes') || lowerMessage.includes('interested') ||
-        lowerMessage.includes('sure') || lowerMessage.includes('great')) {
+        lowerMessage.includes('sure') || lowerMessage.includes('great') ||
+        lowerMessage.includes('love')) {
       intent = 'interested';
     } else if (lowerMessage.includes('no') || lowerMessage.includes('not interested') ||
-               lowerMessage.includes('pass') || lowerMessage.includes('thanks')) {
+               lowerMessage.includes('pass') || lowerMessage.includes('not looking')) {
       intent = 'not_interested';
     }
 
     msg.intent = intent;
 
-    // Generate mock scheduling link if interested
     if (intent === 'interested') {
       candidate.status = 'interested';
       msg.scheduledLink = `https://calendly.com/mock-scheduling/${candidate._id}`;
@@ -166,11 +162,7 @@ router.post('/:id/responses', async (req, res) => {
 
     res.json({
       success: true,
-      data: {
-        message: msg,
-        intent,
-        scheduledLink: msg.scheduledLink
-      }
+      data: { message: msg, intent, scheduledLink: msg.scheduledLink }
     });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });

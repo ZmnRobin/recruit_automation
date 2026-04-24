@@ -3,20 +3,20 @@ import mongoose from 'mongoose';
 import { connection } from '../config/queue.js';
 import { generateOutreachMessage } from '../services/outreachService.js';
 import Task from '../models/Task.js';
-import { taskEvents } from '../services/taskEventEmitter.js';
+import { publishTaskUpdate } from '../services/taskPublisher.js';
 
 async function updateTask(task, fields) {
   if (!task) return;
   Object.assign(task, fields);
   await task.save();
-  taskEvents.emitTaskUpdate(task._id.toString(), {
+  await publishTaskUpdate(task._id.toString(), {
     taskId: task._id.toString(),
     type: task.type,
     status: task.status,
     progress: task.progress || 0,
-    result: task.result || null,
+    result: task.result ? JSON.parse(JSON.stringify(task.result)) : null,
     error: task.error || null,
-    candidateId: task.candidateId?.toString()
+    candidateId: task.candidateId?.toString(),
   });
 }
 
@@ -38,7 +38,10 @@ export const outreachWorker = new Worker('outreach', async (job) => {
     await updateTask(task, {
       status: 'completed',
       progress: 100,
-      result: { messageId: message._id.toString(), status: message.status }
+      result: {
+        messageId: message._id.toString(),
+        status: message.status,
+      },
     });
 
     console.log(`Outreach job ${job.id} completed.`);
@@ -50,12 +53,7 @@ export const outreachWorker = new Worker('outreach', async (job) => {
   }
 }, { connection });
 
-outreachWorker.on('completed', (job) => {
-  console.log(`Outreach BullMQ job ${job.id} completed`);
-});
-
-outreachWorker.on('failed', (job, err) => {
-  console.error(`Outreach BullMQ job ${job.id} failed:`, err.message);
-});
+outreachWorker.on('completed', (job) => console.log(`Outreach BullMQ job ${job.id} completed`));
+outreachWorker.on('failed', (job, err) => console.error(`Outreach BullMQ job ${job.id} failed:`, err.message));
 
 export const outreachQueue = new Queue('outreach', { connection });

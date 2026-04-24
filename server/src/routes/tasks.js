@@ -1,60 +1,56 @@
 import express from 'express';
 import Task from '../models/Task.js';
-import { taskEvents } from '../services/taskEventEmitter.js';
+import { taskBus } from '../services/taskSubscriber.js';
 
 const router = express.Router();
 
 /**
  * GET /api/tasks/:taskId/stream
- * Server-Sent Events endpoint for real-time task status updates.
- * The client subscribes once and receives push updates until task completes/fails.
+ * SSE endpoint — streams task status to the client until terminal state.
  */
 router.get('/:taskId/stream', async (req, res) => {
   const { taskId } = req.params;
 
-  // SSE headers
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+  res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
 
-  const sendEvent = (data) => {
+  const send = (data) => {
     res.write(`data: ${JSON.stringify(data)}\n\n`);
-    // Flush if the method exists (some middleware adds it)
     if (res.flush) res.flush();
   };
 
-  // Send initial task state immediately
+  // 1. Send current snapshot immediately so client isn't left waiting
   try {
     const task = await Task.findById(taskId);
     if (!task) {
-      sendEvent({ error: 'Task not found', taskId });
+      send({ error: 'Task not found', taskId });
       return res.end();
     }
 
-    sendEvent({
+    send({
       taskId,
+      type: task.type,
       status: task.status,
       progress: task.progress || 0,
       result: task.result || null,
       error: task.error || null,
-      type: task.type
     });
 
-    // If already terminal, no need to keep the connection open
+    // Already done — no need to keep the SSE connection open
     if (task.status === 'completed' || task.status === 'failed') {
       return res.end();
     }
   } catch (err) {
-    sendEvent({ error: 'Failed to fetch task', taskId });
+    send({ error: 'Failed to fetch task', taskId });
     return res.end();
   }
 
-  // Subscribe to live updates for this specific task
+  // 2. Subscribe to live Redis-backed updates
   const onUpdate = (data) => {
-    sendEvent(data);
-    // Close connection once terminal state is reached
+    send(data);
     if (data.status === 'completed' || data.status === 'failed') {
       cleanup();
       res.end();
@@ -62,7 +58,7 @@ router.get('/:taskId/stream', async (req, res) => {
   };
 
   const eventKey = `task:${taskId}`;
-  taskEvents.on(eventKey, onUpdate);
+  taskBus.on(eventKey, onUpdate);
 
   // Heartbeat every 20s to keep connection alive through proxies
   const heartbeat = setInterval(() => {
@@ -72,16 +68,15 @@ router.get('/:taskId/stream', async (req, res) => {
 
   const cleanup = () => {
     clearInterval(heartbeat);
-    taskEvents.off(eventKey, onUpdate);
+    taskBus.off(eventKey, onUpdate);
   };
 
-  // Clean up when client disconnects
   req.on('close', cleanup);
 });
 
 /**
  * GET /api/tasks/:taskId
- * Polling fallback — returns current task status snapshot.
+ * Polling fallback — returns current task snapshot.
  */
 router.get('/:taskId', async (req, res) => {
   try {
