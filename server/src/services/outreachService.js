@@ -31,29 +31,51 @@ Write a professional, personalized outreach message (150-200 words). Be friendly
 
   if (process.env.GEMINI_API_KEY) {
     try {
-      const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-      const result = await withRetry(() => model.generateContent(prompt), {
-        retries: 2,
-        delayMs: 1500,
-      });
-      messageContent = result.response.text();
-      console.log(`[outreachService] Gemini message generated for ${candidate.name}`);
-    } catch (error) {
-      const isQuota = error.message?.includes('quota') ||
-                      error.message?.includes('429') ||
-                      error.status === 429;
+      // generateContent() AND .text() are both inside withRetry
+      // so if either fails (including lazy throws from the SDK), it retries
+      messageContent = await withRetry(async () => {
+        console.log(`[outreachService] Calling Gemini for "${candidate.name}"...`);
 
-      console.warn(`[outreachService] Gemini ${isQuota ? 'quota exceeded' : 'error'} for ${candidate.name}:`, error.message);
+        const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+        const result = await model.generateContent(prompt);
+
+        // Explicitly check for blocked/empty response before calling .text()
+        const resp = result?.response?.candidates?.[0];
+        if (!resp) {
+          throw new Error(
+            `Gemini returned no candidates. BlockReason: ${result?.response?.promptFeedback?.blockReason ?? 'unknown'}`
+          );
+        }
+
+        const text = result.response.text();
+        if (!text?.trim()) {
+          throw new Error('Gemini returned empty outreach message text');
+        }
+
+        return text;
+      }, 3, 1500); // 3 attempts, 1.5s → 3s → 6s backoff
+
+      console.log(`[outreachService] Gemini message generated for "${candidate.name}"`);
+    } catch (error) {
+      const isQuota =
+        error.message?.includes('429') ||
+        error.message?.includes('quota') ||
+        error.message?.includes('RESOURCE_EXHAUSTED') ||
+        error.status === 429;
+
+      console.warn(
+        `[outreachService] Gemini FAILED for "${candidate.name}" — ` +
+        `reason: ${isQuota ? 'QUOTA/RATE LIMIT (429)' : error.message} — ` +
+        `falling back to template message`
+      );
+
       messageContent = buildFallbackMessage(candidate, job);
       usedFallback = true;
     }
   } else {
+    console.log(`[outreachService] No GEMINI_API_KEY — using template for "${candidate.name}"`);
     messageContent = buildFallbackMessage(candidate, job);
     usedFallback = true;
-  }
-
-  if (usedFallback) {
-    console.log(`[outreachService] Used template fallback for ${candidate.name}`);
   }
 
   const message = new Message({
@@ -70,20 +92,20 @@ Write a professional, personalized outreach message (150-200 words). Be friendly
   candidate.status = 'contacted';
   await candidate.save();
 
+  console.log(
+    `[outreachService] Message saved for "${candidate.name}" ` +
+    `(source: ${usedFallback ? 'template' : 'gemini'})`
+  );
+
   return message;
 }
 
-/**
- * Fallback message builder — varies structure and wording based on candidate
- * data so repeated fallbacks don't all look identical.
- */
 function buildFallbackMessage(candidate, job) {
   const firstName = candidate.name.split(' ')[0];
   const topSkills = (candidate.skills || []).slice(0, 3);
   const hasSkills = topSkills.length > 0;
   const isRemote = job.location?.toLowerCase().includes('remote');
 
-  // Pick an opening variant based on the candidate's role
   const openings = [
     `I came across your profile and was genuinely impressed by your background as ${candidate.currentRole}.`,
     `Your experience as ${candidate.currentRole} caught my attention while I was searching for strong candidates.`,
@@ -91,17 +113,14 @@ function buildFallbackMessage(candidate, job) {
   ];
   const opening = openings[candidate.name.length % openings.length];
 
-  // Skills sentence — only include if we have skills data
   const skillsSentence = hasSkills
     ? `Your expertise in ${topSkills.join(', ')} is a strong match for what we need.`
     : `Your experience aligns well with what we're looking for in this role.`;
 
-  // Location sentence
   const locationSentence = isRemote
     ? `The position is fully remote, so there's no relocation required.`
     : `The role is based in ${job.location}, offering a ${job.employmentType || 'full-time'} position.`;
 
-  // CTA variant based on experience level
   const yearsMatch = candidate.experience?.match(/(\d+)/);
   const years = yearsMatch ? parseInt(yearsMatch[1]) : 0;
   const cta = years >= 5
